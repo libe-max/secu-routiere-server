@@ -1,0 +1,223 @@
+#!/usr/bin/env node
+
+const fs = require('fs').promises
+const path = require('path')
+const express = require('express')
+const router = express.Router()
+const csv = require('csv-parse/lib/sync')
+const Pool = require('pg').Pool
+const dbUser = require('../secrets/postgresql_db_user.json')
+const pool = new Pool(dbUser)
+
+const query = (q, p = []) => new Promise((resolve, reject) => {
+  pool.query(q, p, (err, data) => err ? reject(err) : resolve(data))
+})
+
+initCsvData()
+
+async function initCsvData () {
+  console.log('Starting.')
+  try {
+  
+    // Check if csv-data folder is ok
+    console.log('\nI. Checking csv-data folder structure...')
+    const csvDataDirPath = path.join(__dirname, '../csv-data')
+    const rawDirs = await fs.readdir(csvDataDirPath)
+    const dirs = rawDirs.filter(dir => !dir.match(/^\./))
+    if (dirs.length !== 4
+        || dirs.indexOf('0_caracteristiques') === -1
+        || dirs.indexOf('1_lieux') === -1
+        || dirs.indexOf('2_vehicules') === -1
+        || dirs.indexOf('3_usagers') === -1) {
+      throw `Invalid data structure. Directory should contain: 0_caracteristiques/, 1_lieux/, 2_vehicules/, 3_usagers/ IN: ${csvDataDirPath}`
+    }
+
+    for (const dir of dirs) {
+      const dirPath = path.join(csvDataDirPath, dir)
+      const dirStat = await fs.lstat(dirPath)
+      const dirIsDirectory = dirStat.isDirectory()
+      if (!dirIsDirectory) throw `Invalid data structure. Not a directory: ${dirPath}`
+    }
+    console.log('  OK.')
+
+    // Clear database
+    console.log('\nII. Clearing database...')
+    const checkE = await query(`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_type='BASE TABLE'
+      AND table_schema='public'
+      AND table_catalog='${dbUser.database}'
+      AND table_name='events'`)
+    if (checkE.rows.length <= 0) {
+      console.log('  events table does not exist')
+    } else {
+      await query('DROP TABLE events')
+      console.log(`  events table dropped (${checkE.rows.length} rows)`)
+    }
+    const checkV = await query(`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_type='BASE TABLE'
+      AND table_schema='public'
+      AND table_catalog='${dbUser.database}'
+      AND table_name='vehicles'`)
+    if (checkV.rows.length <= 0) {
+      console.log('  vehicles table does not exist')
+    } else {
+      await query('DROP TABLE vehicles')
+      console.log(`  vehicles table dropped (${checkV.rows.length} rows)`)
+    }
+    const checkU = await query(`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_type='BASE TABLE'
+      AND table_schema='public'
+      AND table_catalog='${dbUser.database}'
+      AND table_name='users'`)
+    if (checkU.rows.length <= 0) {
+      console.log('  users table does not exist.')
+    } else {
+      await query('DROP TABLE users')
+      console.log(`  users table dropped (${checkU.rows.length} rows).`)
+    }
+    
+    // Setup database
+    console.log('\nIII. Setting up database...')
+    const createdE = await query(`CREATE TABLE events (
+      _id SERIAL PRIMARY KEY, num_acc TEXT, an TEXT, mois TEXT,
+      jour TEXT, hrmn TEXT, lum TEXT, agg TEXT, int TEXT,
+      atm TEXT, col TEXT, com TEXT, adr TEXT, gps TEXT,
+      lat TEXT, long TEXT, dep TEXT, catr TEXT, voie TEXT,
+      v1 TEXT, v2 TEXT, circ TEXT, nbv TEXT, pr TEXT, pr1 TEXT,
+      vosp TEXT, prof TEXT, plan TEXT, lartpc TEXT, larrout TEXT,
+      surf TEXT, infra TEXT, situ TEXT, env1 TEXT, vma TEXT
+    )`)
+    console.log('  events table created')
+    const createdV = await query(`CREATE TABLE vehicles (
+      _id SERIAL PRIMARY KEY, id_vehicule TEXT, num_veh TEXT,
+      num_acc TEXT, senc TEXT, catv TEXT, occutc TEXT, obs TEXT,
+      obsm TEXT, choc TEXT, manv TEXT, motor TEXT
+    )`)
+    console.log('  vehicles table created')
+    const createdU = await query(`CREATE TABLE users (
+      _id SERIAL PRIMARY KEY, id_vehicule TEXT, num_veh TEXT,
+      num_acc TEXT, place TEXT, catu TEXT, grav TEXT, sexe TEXT,
+      an_nais TEXT, trajet TEXT, secu TEXT, secu1 TEXT, secu2 TEXT,
+      secu3 TEXT, locp TEXT, actp TEXT, etatp TEXT
+    )`)
+    console.log('  users table created.')
+
+    // Save data
+    const caracteristiquesFilesPath = path.join(csvDataDirPath, '0_caracteristiques')
+    const lieuxFilesPath = path.join(csvDataDirPath, '1_lieux')
+    const vehiculesFilesPath = path.join(csvDataDirPath, '2_vehicules')
+    const usagersFilesPath = path.join(csvDataDirPath, '3_usagers')
+    console.log('\nIV. Pouring characteristics CSVs into events table...')
+    const savedC = await saveType(caracteristiquesFilesPath, 'characteristics')
+    console.log('\nV. Pouring places CSVs into events table.')
+    const savedL = await saveType(lieuxFilesPath, 'places')
+    console.log('\nVI. Pouring vehicles CSVs into vehicles table.')
+    const savedV = await saveType(vehiculesFilesPath, 'vehicles')
+    console.log('\nVII. Pouring users CSVs into users table.')
+    const savedU = await saveType(usagersFilesPath, 'users')
+    
+    console.log('\nDone.')
+    return
+  } catch (err) {
+    console.error('\nERROR:', err)
+    console.log('\nExiting.')
+    return process.exit(1)
+  }
+}
+
+async function saveType (dirPath, type) {
+  const files = await fs.readdir(dirPath)
+  const filesToRead = []
+  for (file of files) {
+    const filePath = path.join(dirPath, file)
+    const fileStat = await fs.lstat(filePath)
+    const fileIsCsv = fileStat.isFile() && filePath.match(/.csv$/)
+    if (fileIsCsv) filesToRead.push(filePath)
+  }
+  for (filePath of filesToRead) {
+    const processedFile = await saveFile(filePath, type)
+  }
+  return true
+}
+
+async function saveFile (filePath, type) {
+  const rawFileContent = await fs.readFile(filePath, 'utf-8')
+  const fileContent = rawFileContent.replace(/\r/gm, '').split('\n').slice(1).join('\n').trim()
+  const commaCount = (fileContent.match(/,/gm) || []).length
+  const colonCount = (fileContent.match(/;/gm) || []).length
+  const tabCount = (fileContent.match(/\t/gm) || []).length
+  const maxCount = Math.max(commaCount, colonCount, tabCount)
+  const delimiter = commaCount === maxCount ? ',' : colonCount === maxCount ? ';' : '\t'
+  const table = csv(fileContent, { delimiter })
+  const head = rawFileContent.replace(/\r/gm, '').split('\n')[0].split(delimiter).map(e => e.replace(/"/gm, '').toLowerCase())
+  const nbLinesPerChunk = 20
+  const nbChunks = Math.ceil(table.length / nbLinesPerChunk)
+  const tableChunks = new Array(nbChunks)
+    .fill(null)
+    .map((e, i) => table.slice(i * nbLinesPerChunk, (i + 1) * nbLinesPerChunk))
+  console.log(`\n  ${filePath.split('/').slice(-1)}`)
+  console.log(`  ${head.join(',')}`)
+  console.log(`  ${head.length} cols, ${table.length} rows, ${tableChunks.length} chunks\n`)
+  for (const i in tableChunks) {
+    const chunk = tableChunks[i]
+    console.log(`\n    ${filePath.split('/').slice(-1)}. Saving chunk ${parseInt(i) + 1}/${tableChunks.length} as ${type} (${chunk.length} rows)...`)
+    const chunkSaved = await saveChunk(type, chunk, head)
+  }
+  return true
+}
+
+async function saveChunk (type, chunk, head) {
+  console.log(`    head: ${head.join(',')}\n`)
+  if (type === 'characteristics') {
+    const done = await Promise.all(chunk.map((line, lineNb) => new Promise(async (resolve, reject) => {
+      const q = `INSERT INTO events (${head.join(',')}) VALUES (${line.map((e, i) => `$${i + 1}`).join(',')})`
+      console.log(`    ${line.length} • ${q}`)
+      console.log(`    ${line.join('•')}`)
+      const result = await query(q, line)
+      resolve()
+    })))
+    return true
+  } else if (type === 'places') {
+    const pute = ['abc', 'def', 'ghi']
+    const done = await Promise.all(chunk.map((line, lineNb) => new Promise(async (resolve, reject) => {
+      const numAccPos = head.indexOf('num_acc')
+      const numAcc = line[numAccPos]
+      const headNoNumAcc = [...head.slice(0, numAccPos), ...head.slice(numAccPos + 1)]
+      const lineNoNumAcc = [...line.slice(0, numAccPos), ...line.slice(numAccPos + 1)]
+      const q = `UPDATE events SET (${headNoNumAcc.join(',')}) = (${headNoNumAcc.map((e, i) => `$${i + 1}`).join(',')}) WHERE num_acc = $${headNoNumAcc.length + 1}`
+      console.log(`    ${lineNoNumAcc.length} • ${q}`)
+      console.log(`    ${lineNoNumAcc.join('•')}`)
+      const result = await query(q, [...lineNoNumAcc, numAcc.toString()])
+      resolve()
+    })))
+    return true
+  } else if (type === 'vehicles') {
+    const done = await Promise.all(chunk.map((line, lineNb) => new Promise(async (resolve, reject) => {
+      const q = `INSERT INTO vehicles (${head.join(',')}) VALUES (${line.map((e, i) => `$${i + 1}`).join(',')})`
+      console.log(`    ${line.length} • ${q}`)
+      console.log(`    ${line.join('•')}`)
+      const result = await query(q, line)
+      resolve()
+    })))
+    return true
+  } else if (type === 'users') {
+    const done = await Promise.all(chunk.map((line, lineNb) => new Promise(async (resolve, reject) => {
+      const q = `INSERT INTO users (${head.join(',')}) VALUES (${line.map((e, i) => `$${i + 1}`).join(',')})`
+      console.log(`    ${line.length} • ${q}`)
+      console.log(`    ${line.join('•')}`)
+      const result = await query(q, line)
+      resolve()
+    })))
+    return true
+  } else {
+    return true
+  }
+}
+
+module.exports = router

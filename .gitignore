@@ -1,0 +1,4 @@
+node_modules/
+secrets/
+csv-data/
+.DS_Store
